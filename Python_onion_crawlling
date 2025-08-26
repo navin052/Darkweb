@@ -415,7 +415,9 @@ def main():
 if __name__ == "__main__":
     main()
 
-//pip install "requests[socks]" beautifulsoup4 tldextract chardet
+/////////////////////////////////////////////////////////////////////////
+"""
+    1.  pip install "requests[socks]" beautifulsoup4 tldextract chardet
 
 	2.	(Optional) start Tor locally so .onion works:
 
@@ -432,4 +434,5 @@ if __name__ == "__main__":
   --use-tor \
   --max-depth 2 \
   --per-site-limit 50 \
-  --rate-delay 2.0  //
+  --rate-delay 2.0 
+"""
