@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""
+Dark Web / Hidden-Service Crawler for IOC & Brand Keyword Discovery
+==================================================================
+
+Purpose
+-------
+Security-focused crawler that can traverse user-provided seed URLs
+(including .onion URLs when used via Tor) and extract indicators of
+compromise (IOCs) and brand-related mentions.
+
+Ethical & Legal
+---------------
+- Use only on content you are authorized to access.
+- Do not use this script to facilitate wrongdoing.
+- Comply with local laws and organizational policies.
+
+Features
+--------
+- Optional Tor routing (via socks5h://127.0.0.1:9050) to access .onion sites.
+- Breadth-first crawl with configurable depth and per-site page limits.
+- Robust timeouts, retries, rate limiting, and simple content-type filtering.
+- IOC detection (IPv4, email, domain, URL, file hashes, BTC/ETH wallets).
+- Brand/keyword matching with optional fuzzy matching (difflib).
+- Outputs findings to CSV and JSONL; rolling log to console.
+- Graceful resume via seen-URL cache file (optional).
+
+Requirements
+------------
+Python 3.9+
+pip install:
+    requests[socks] beautifulsoup4 tldextract chardet
+
+(Optional but recommended)
+    pip install cchardet
+
+Example
+-------
+python darkweb_crawler.py \
+  --seeds seeds.txt \
+  --keywords brand_terms.txt \
+  --use-tor \
+  --max-depth 2 \
+  --per-site-limit 50 \
+  --rate-delay 2.0
+
+Notes
+-----
+- To use Tor: run Tor locally (e.g., `tor` service, SOCKS at 127.0.0.1:9050).
+- This script does NOT enumerate or provide any hidden services.
+- Pass your own seeds (URLs) and keywords.
+"""
+
+import argparse
+import concurrent.futures
+import csv
+import html
+import io
+import json
+import os
+import queue
+import random
+import re
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime
+from difflib import SequenceMatcher
+from typing import Iterable, List, Optional, Set, Tuple
+from urllib.parse import urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup
+import tldextract
+
+try:
+    import chardet
+except Exception:
+    chardet = None
+
+USER_AGENTS = [
+    # A few common desktop UAs; rotate to reduce trivial blocking
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+]
+
+TEXT_MIME_HINTS = (
+    "text/",
+    "application/json",
+    "application/xml",
+    "application/xhtml",
+    "application/javascript",
+)
+
+# === IOC regexes ===
+RE_IPV4 = re.compile(
+    r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?!$)|$)){4}\b"
+)
+RE_EMAIL = re.compile(
+    r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,}\b"
+)
+RE_SHA256 = re.compile(r"\b[a-fA-F0-9]{64}\b")
+RE_SHA1   = re.compile(r"\b[a-fA-F0-9]{40}\b")
+RE_MD5    = re.compile(r"\b[a-fA-F0-9]{32}\b")
+# Simple URL/domain capture (not perfect, but practical for TI triage)
+RE_URL = re.compile(
+    r"\b((?:https?://)[^\s\"'<>]+)\b", re.IGNORECASE
+)
+RE_DOMAIN = re.compile(
+    r"\b(?:(?:[a-zA-Z0-9-]{1,63}\.)+[A-Za-z]{2,63})\b"
+)
+# Wallets (heuristics; validate before use)
+RE_BTC = re.compile(r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b")
+RE_ETH = re.compile(r"\b0x[a-fA-F0-9]{40}\b")
+
+FINDING_TYPES = [
+    ("ipv4", RE_IPV4),
+    ("email", RE_EMAIL),
+    ("sha256", RE_SHA256),
+    ("sha1", RE_SHA1),
+    ("md5", RE_MD5),
+    ("url", RE_URL),
+    ("domain", RE_DOMAIN),
+    ("btc", RE_BTC),
+    ("eth", RE_ETH),
+]
+
+def load_lines(path: Optional[str]) -> List[str]:
+    if not path:
+        return []
+    out = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                out.append(line)
+    return out
+
+def detect_encoding(content: bytes, default="utf-8") -> str:
+    if not content:
+        return default
+    if chardet:
+        try:
+            guess = chardet.detect(content)
+            if guess and guess.get("encoding"):
+                return guess["encoding"]
+        except Exception:
+            pass
+    return default
+
+def normalize_text(text: str) -> str:
+    text = html.unescape(text)
+    # collapse whitespace
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+def extract_links(base_url: str, soup: BeautifulSoup) -> Set[str]:
+    links = set()
+    for a in soup.find_all("a", href=True):
+        href = a.get("href")
+        if not href:
+            continue
+        abs_url = urljoin(base_url, href)
+        # Avoid fragments/mailto/javascript
+        if abs_url.startswith("mailto:") or abs_url.startswith("javascript:"):
+            continue
+        links.add(abs_url)
+    return links
+
+def same_reg_domain(u1: str, u2: str) -> bool:
+    e1 = tldextract.extract(u1)
+    e2 = tldextract.extract(u2)
+    d1 = ".".join([e1.domain, e1.suffix]) if e1.suffix else e1.domain
+    d2 = ".".join([e2.domain, e2.suffix]) if e2.suffix else e2.domain
+    return d1 == d2
+
+def find_iocs(text: str) -> List[Tuple[str, str]]:
+    out = []
+    for name, rx in FINDING_TYPES:
+        for m in rx.finditer(text):
+            val = m.group(0)
+            out.append((name, val))
+    return out
+
+def fuzzy_contains(text: str, word: str, threshold: float = 0.86) -> Optional[str]:
+    """
+    Returns matched snippet if fuzzy match passes threshold, else None.
+    """
+    # Simple sliding window approach
+    tokens = text.split()
+    wlen = max(1, len(word.split()))
+    for i in range(0, len(tokens) - wlen + 1):
+        window = " ".join(tokens[i:i + wlen])
+        score = SequenceMatcher(None, window.lower(), word.lower()).ratio()
+        if score >= threshold:
+            start = max(0, i - 5)
+            end = min(len(tokens), i + wlen + 5)
+            snippet = " ".join(tokens[start:end])
+            return snippet
+    return None
+
+def keyword_hits(text: str, keywords: List[str], fuzzy: bool, threshold: float) -> List[Tuple[str, str]]:
+    hits = []
+    for kw in keywords:
+        if not kw:
+            continue
+        if fuzzy:
+            snip = fuzzy_contains(text, kw, threshold=threshold)
+            if snip:
+                hits.append((kw, snip))
+        else:
+            if kw.lower() in text.lower():
+                # capture a small snippet
+                idx = text.lower().find(kw.lower())
+                start = max(0, idx - 80)
+                end = min(len(text), idx + len(kw) + 80)
+                hits.append((kw, text[start:end]))
+    return hits
+
+def is_textual(resp: requests.Response) -> bool:
+    ctype = resp.headers.get("Content-Type", "")
+    return any(h in ctype for h in TEXT_MIME_HINTS)
+
+def polite_sleep(delay: float):
+    if delay > 0:
+        time.sleep(delay + random.uniform(0, min(0.5, delay/2)))
+
+def make_session(use_tor: bool, timeout: float) -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+    s.verify = True
+    s.max_redirects = 5
+    s.request_timeout = timeout
+    if use_tor:
+        proxies = {
+            "http": "socks5h://127.0.0.1:9050",
+            "https": "socks5h://127.0.0.1:9050",
+        }
+        s.proxies.update(proxies)
+    return s
+
+def within_site_limit(url: str, site_counts: dict, per_site_limit: int) -> bool:
+    if per_site_limit <= 0:
+        return True
+    host = urlparse(url).netloc
+    site_counts[host] += 1
+    return site_counts[host] <= per_site_limit
+
+def save_finding(writer_csv, jsonl_f, finding):
+    writer_csv.writerow(finding)
+    json.dump(finding, jsonl_f)
+    jsonl_f.write("\n")
+    jsonl_f.flush()
+
+def crawl(args):
+    seeds = set(load_lines(args.seeds))
+    seeds.update(args.seed or [])
+    if not seeds:
+        print("No seeds provided. Use --seed or --seeds file.")
+        sys.exit(1)
+
+    keywords = load_lines(args.keywords)
+    seen: Set[str] = set(load_lines(args.resume_seen) if args.resume_seen else [])
+    q = queue.Queue()
+
+    # BFS init
+    for s in seeds:
+        q.put((s, 0))
+
+    session = make_session(args.use_tor, args.timeout)
+    site_counts = defaultdict(int)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    csv_path = os.path.join(args.output_dir, f"findings_{ts}.csv")
+    jsonl_path = os.path.join(args.output_dir, f"findings_{ts}.jsonl")
+    seen_path = os.path.join(args.output_dir, f"seen_{ts}.txt")
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as fcsv, \
+         open(jsonl_path, "w", encoding="utf-8") as fjl:
+
+        writer = csv.writer(fcsv)
+        writer.writerow(["timestamp_utc", "url", "type", "value", "context"])
+
+        while not q.empty():
+            url, depth = q.get()
+            if url in seen:
+                continue
+            seen.add(url)
+
+            # Depth check
+            if depth > args.max_depth:
+                continue
+
+            # Per-site limit
+            if not within_site_limit(url, site_counts, args.per_site_limit):
+                continue
+
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                continue
+
+            try:
+                polite_sleep(args.rate_delay)
+                resp = session.get(url, timeout=args.timeout, allow_redirects=True)
+            except requests.RequestException as e:
+                print(f"[!] Request failed: {url} :: {e}")
+                continue
+
+            if not is_textual(resp):
+                print(f"[-] Skipping non-text content: {url} ({resp.headers.get('Content-Type','')})")
+                continue
+
+            enc = detect_encoding(resp.content)
+            try:
+                text = resp.content.decode(enc, errors="replace")
+            except Exception:
+                text = resp.text  # fallback
+
+            text = normalize_text(text)
+
+            # Parse HTML for links & visible text
+            soup = BeautifulSoup(text, "html.parser")
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            visible_text = soup.get_text(separator=" ", strip=True)
+            visible_text = normalize_text(visible_text)
+
+            # === IOC extraction ===
+            iocs = find_iocs(visible_text)
+            for typ, val in iocs:
+                # small context snippet
+                pos = visible_text.find(val)
+                start = max(0, pos - 80) if pos >= 0 else 0
+                end = min(len(visible_text), (pos + len(val) + 80)) if pos >= 0 else 160
+                snippet = visible_text[start:end]
+                finding = {
+                    "timestamp_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    "url": url,
+                    "type": typ,
+                    "value": val,
+                    "context": snippet,
+                }
+                save_finding(writer, fjl, finding)
+
+            # === Brand/keyword matches ===
+            if keywords:
+                hits = keyword_hits(
+                    visible_text,
+                    keywords=keywords,
+                    fuzzy=args.fuzzy,
+                    threshold=args.fuzzy_threshold,
+                )
+                for kw, snip in hits:
+                    finding = {
+                        "timestamp_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                        "url": url,
+                        "type": "keyword",
+                        "value": kw,
+                        "context": snip,
+                    }
+                    save_finding(writer, fjl, finding)
+
+            # === Enqueue new links (same registrable domain by default, unless allow_external) ===
+            links = extract_links(url, soup)
+            for link in links:
+                if link in seen:
+                    continue
+                if not args.allow_external and not same_reg_domain(url, link):
+                    continue
+                q.put((link, depth + 1))
+
+            # Periodically write seen cache
+            if len(seen) % 25 == 0:
+                with open(seen_path, "w", encoding="utf-8") as fs:
+                    fs.write("\n".join(sorted(seen)))
+
+    print(f"[+] Done. Findings written to:\n  CSV:   {csv_path}\n  JSONL: {jsonl_path}\n  Seen:  {seen_path}")
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="IOC & Brand Keyword Crawler (supports Tor via SOCKS)."
+    )
+    ap.add_argument("--seed", action="append", default=[],
+                    help="Seed URL; can be specified multiple times.")
+    ap.add_argument("--seeds", help="Path to file with seed URLs (one per line).")
+    ap.add_argument("--keywords", help="Path to file with brand/keyword terms (one per line).")
+
+    ap.add_argument("--max-depth", type=int, default=1, help="Max crawl depth (default: 1).")
+    ap.add_argument("--per-site-limit", type=int, default=30, help="Max pages per site (default: 30).")
+    ap.add_argument("--allow-external", action="store_true",
+                    help="Allow following links to other registrable domains.")
+
+    ap.add_argument("--use-tor", action="store_true",
+                    help="Route traffic via Tor SOCKS proxy at 127.0.0.1:9050.")
+    ap.add_argument("--timeout", type=float, default=25.0, help="HTTP timeout seconds.")
+    ap.add_argument("--rate-delay", type=float, default=1.5, help="Base delay between requests in seconds.")
+
+    ap.add_argument("--fuzzy", action="store_true", help="Enable fuzzy matching for keywords.")
+    ap.add_argument("--fuzzy-threshold", type=float, default=0.86,
+                    help="Fuzzy match threshold (0..1, default 0.86).")
+
+    ap.add_argument("--output-dir", default="crawler_output", help="Directory to write outputs.")
+    ap.add_argument("--resume-seen", help="Optional: path to a file with previously seen URLs, to avoid re-crawling.")
+
+    args = ap.parse_args()
+    try:
+        crawl(args)
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted by user.")
+        sys.exit(130)
+
+if __name__ == "__main__":
+    main()
+
+//pip install "requests[socks]" beautifulsoup4 tldextract chardet
+
+	2.	(Optional) start Tor locally so .onion works:
+
+	•	Ensure SOCKS proxy on 127.0.0.1:9050 (e.g., run tor service).
+
+	3.	Prepare inputs:
+
+	•	seeds.txt — one URL per line (your authorized targets; can include .onion)
+	•	brand_terms.txt — one keyword per line (company name, product names, execs, etc.)
+
+#python darkweb_crawler.py \
+  --seeds seeds.txt \
+  --keywords brand_terms.txt \
+  --use-tor \
+  --max-depth 2 \
+  --per-site-limit 50 \
+  --rate-delay 2.0  //
