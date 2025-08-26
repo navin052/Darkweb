@@ -41,3 +41,29 @@ The dark web is a hidden part of the internet that isn’t accessible through re
 	•	Legal Risks: Many activities are illegal; accessing or buying can lead to prosecution.
 	•	Security Risks: Malware, phishing, scams are rampant.
 	•	Privacy Risks: Even with Tor, mistakes (logging in with personal info, not using VPN, enabling JavaScript) can expose your identity.
+
+the term “seed” in the dark web can mean a couple of different things depending on the context, because it’s not a single standardized word. Here are the main uses:
+
+⸻
+
+1. Torrent / File Sharing Context
+	•	On both the surface web and the dark web, “seed” is often related to torrenting (BitTorrent, P2P sharing).
+	•	Seeding = When you finish downloading a file, your client continues to upload/share pieces of it with other peers.
+	•	A “seed” = A peer that has the entire file and is sharing it with others.
+	•	Dark web marketplaces sometimes use torrent-like sharing systems to distribute tools, leaked data, or large files.
+
+⸻
+
+2. Seed Phrases / Wallets (Cryptocurrency)
+	•	Since Bitcoin and Monero are the main payment methods on the dark web, “seed” is also used in crypto wallets.
+	•	A “seed phrase” (12–24 words) is the recovery phrase that gives you full access to your wallet.
+	•	Dark web vendors and buyers must protect their wallet seed phrase because whoever has it controls the funds.
+
+⸻
+
+3. Botnets / Malware Context
+	•	In cybercrime forums, “seed” can also mean initial infection or first bots in a botnet.
+	•	Example: an attacker “seeds” malware into victim machines (like phishing emails or cracked software) to grow a botnet.
+	•	Those “seeds” become the base from which the malware spreads.
+
+⸻
