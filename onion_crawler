@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse, time, random, re, csv, json, sys, queue
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+import requests
+from requests.exceptions import RequestException
+import tldextract
+
+# Optional: circuit rotation with Stem
+try:
+    from stem import Signal
+    from stem.control import Controller
+    STEM_AVAILABLE = True
+except Exception:
+    STEM_AVAILABLE = False
+
+USER_AGENT = "OnionOSINT/1.0 (+https://example.invalid)"
+DEFAULT_SOCKS = "socks5h://127.0.0.1:9050"
+
+IOC_REGEX = {
+    "ipv4": re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.|$)){4}\b"),
+    "domain": re.compile(r"\b(?:[a-z0-9][a-z0-9\-]{0,62}\.)+[a-z]{2,24}\b", re.I),
+    "url": re.compile(r"\bhttps?://[^\s\"'>)]+", re.I),
+    "email": re.compile(r"\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,24}\b", re.I),
+    "sha256": re.compile(r"\b[a-f0-9]{64}\b", re.I),
+    "sha1": re.compile(r"\b[a-f0-9]{40}\b", re.I),
+    "md5": re.compile(r"\b[a-f0-9]{32}\b", re.I),
+    "btc": re.compile(r"\b(bc1[0-9a-z]{25,62}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b"),
+    # onion URLs (v3)
+    "onion": re.compile(r"\b[a-z2-7]{56}\.onion\b", re.I),
+}
+
+def normalize_domain(d):
+    # Avoid false positives on things like 127.0.0.1
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", d):
+        return None
+    return d.lower()
+
+def extract_iocs(text):
+    found = {}
+    for k, rgx in IOC_REGEX.items():
+        vals = set(m.group(0) for m in rgx.finditer(text or ""))
+        if k == "domain":
+            vals = {v for v in (normalize_domain(x) for x in vals) if v}
+        if vals:
+            found[k] = sorted(vals)
+    return found
+
+def build_session(socks_url):
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT})
+    s.proxies.update({"http": socks_url, "https": socks_url})
+    s.timeout = 45
+    return s
+
+def same_host(u1, u2):
+    return urlparse(u1).netloc.lower() == urlparse(u2).netloc.lower()
+
+def is_onion_url(u):
+    try:
+        return urlparse(u).hostname and urlparse(u).hostname.endswith(".onion")
+    except Exception:
+        return False
+
+def get_robots(session, base):
+    # Fetch and parse robots.txt if present; default to allow all if not reachable
+    robots_url = urljoin(base, "/robots.txt")
+    try:
+        r = session.get(robots_url, timeout=20)
+        if r.status_code != 200 or len(r.text) > 200_000:
+            return None
+        return parse_robots(r.text)
+    except RequestException:
+        return None
+
+def parse_robots(text):
+    # Very small robots parser (User-agent * only)
+    disallow = []
+    ua = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(":", 1)]
+        if len(parts) != 2:
+            continue
+        k, v = parts[0].lower(), parts[1]
+        if k == "user-agent":
+            ua = v
+        elif k == "disallow" and (ua == "*" or ua is None):
+            disallow.append(v if v.startswith("/") else "/" + v)
+    return disallow or None
+
+def allowed_by_robots(disallow_rules, path):
+    if not disallow_rules:
+        return True
+    for rule in disallow_rules:
+        if path.startswith(rule):
+            return False
+    return True
+
+def rotate_circuit(ctrl_port, ctrl_password):
+    if not STEM_AVAILABLE:
+        return False
+    try:
+        with Controller.from_port(port=ctrl_port) as c:
+            c.authenticate(password=ctrl_password)
+            c.signal(Signal.NEWNYM)
+        return True
+    except Exception:
+        return False
+
+def crawl(args):
+    session = build_session(args.socks)
+    seeds = [u.strip() for u in args.seeds if u.strip()]
+    frontier = queue.Queue()
+    for s in seeds:
+        frontier.put((s, 0))
+    seen_pages = set()
+    seen_hosts = {}
+    iocs_global = set()
+
+    # Output writers
+    pages_out = open(args.pages_out, "w", encoding="utf-8")
+    iocs_csv = open(args.iocs_out, "w", newline="", encoding="utf-8")
+    ioc_writer = csv.writer(iocs_csv)
+    ioc_writer.writerow(["indicator", "type", "source_url", "context_preview"])
+
+    start_time = time.time()
+    processed = 0
+
+    while not frontier.empty() and processed < args.max_pages:
+        url, depth = frontier.get()
+        if url in seen_pages:
+            continue
+        seen_pages.add(url)
+
+        if not is_onion_url(url):
+            continue
+
+        host = urlparse(url).netloc
+        seen_hosts.setdefault(host, 0)
+        if seen_hosts[host] >= args.max_per_host:
+            continue
+
+        # robots.txt (per host, cached)
+        disallow = seen_hosts.get(host) if isinstance(seen_hosts.get(host), list) else None
+        if disallow is None:
+            disallow = get_robots(session, f"http://{host}")
+            seen_hosts[host] = disallow if disallow is not None else 0  # store list or count
+
+        path = urlparse(url).path or "/"
+        if isinstance(seen_hosts[host], list):
+            if not allowed_by_robots(seen_hosts[host], path):
+                continue
+
+        # politeness
+        time.sleep(args.delay + random.uniform(0, args.delay * 0.5))
+
+        # Optional circuit rotation
+        if args.rotate_every and processed and processed % args.rotate_every == 0 and args.ctrl_port and args.ctrl_password:
+            rotate_circuit(args.ctrl_port, args.ctrl_password)
+
+        try:
+            r = session.get(url, allow_redirects=True, timeout=45)
+            status = r.status_code
+            html = r.text if (r.headers.get("content-type", "").lower().startswith("text/") and len(r.content) <= args.max_bytes) else ""
+        except RequestException as e:
+            status, html = f"ERR:{type(e).__name__}", ""
+
+        title = ""
+        links = []
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
+            title_tag = soup.find("title")
+            title = (title_tag.text or "").strip()[:200] if title_tag else ""
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                if href.startswith("#") or href.lower().startswith("javascript:"):
+                    continue
+                nxt = urljoin(url, href)
+                if not is_onion_url(nxt):
+                    # keep .onion-only frontier (set --allow-external to include)
+                    if not args.allow_external:
+                        continue
+                if args.same_host_only and not same_host(url, nxt):
+                    continue
+                links.append(nxt)
+
+        # Extract IOCs (from visible HTML)
+        text_for_ioc = html
+        found = extract_iocs(text_for_ioc)
+        for t, vals in found.items():
+            for v in vals:
+                key = (v, t)
+                if key in iocs_global:
+                    continue
+                iocs_global.add(key)
+                # 80-char text preview
+                preview = (html[:80].replace("\n", " ") if html else "")
+                ioc_writer.writerow([v, t, url, preview])
+
+        # Write page record
+        rec = {"url": url, "status": status, "title": title, "depth": depth, "links_found": len(links)}
+        pages_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        processed += 1
+        # Update per-host count if we stored a count (not a list)
+        if not isinstance(seen_hosts[host], list):
+            seen_hosts[host] += 1
+
+        # Enqueue next links
+        if depth < args.max_depth:
+            random.shuffle(links)
+            for nxt in links:
+                if nxt not in seen_pages:
+                    frontier.put((nxt, depth + 1))
+
+    pages_out.close()
+    iocs_csv.close()
+
+    print(f"[done] pages={processed} seeds={len(seeds)} unique_iocs={len(iocs_global)} elapsed={int(time.time()-start_time)}s")
+    print(f"Pages JSONL: {args.pages_out}")
+    print(f"IOCs CSV:    {args.iocs_out}")
+
+def main():
+    ap = argparse.ArgumentParser(description="Tor-based .onion crawler for OSINT/IOCs (polite).")
+    ap.add_argument("--seeds", nargs="+", required=True, help="Seed .onion URLs (space-separated).")
+    ap.add_argument("--socks", default=DEFAULT_SOCKS, help="SOCKS proxy (Tor). Default: socks5h://127.0.0.1:9050")
+    ap.add_argument("--max-pages", type=int, default=100, help="Max pages to fetch overall.")
+    ap.add_argument("--max-per-host", type=int, default=20, help="Max pages per host.")
+    ap.add_argument("--max-depth", type=int, default=2, help="Max crawl depth from each seed.")
+    ap.add_argument("--delay", type=float, default=3.0, help="Base delay seconds between requests.")
+    ap.add_argument("--max-bytes", type=int, default=2_000_000, help="Skip parsing if response body exceeds this.")
+    ap.add_argument("--same-host-only", action="store_true", help="Only follow links within the same .onion host.")
+    ap.add_argument("--allow-external", action="store_true", help="Allow following links to other hosts (still .onion by default).")
+    ap.add_argument("--rotate-every", type=int, default=0, help="Rotate Tor circuit every N pages (requires Stem). 0=disabled.")
+    ap.add_argument("--ctrl-port", type=int, default=9051, help="Tor ControlPort (for rotation).")
+    ap.add_argument("--ctrl-password", default="", help="Tor ControlPort password.")
+    ap.add_argument("--pages-out", default="pages.jsonl", help="Output file for page metadata.")
+    ap.add_argument("--iocs-out", default="iocs.csv", help="Output CSV for extracted IOCs.")
+    args = ap.parse_args()
+    crawl(args)
+
+if __name__ == "__main__":
+    main()
+
+
+
+# System Tor (listens on SOCKS 9050)
+#sudo apt update && sudo apt install -y tor
+
+# Optional (for circuit rotation)
+#sudo apt install -y python3-stem
+
+# Python libs
+#python3 -m pip install requests[socks] beautifulsoup4 tldextract
+# Example seeds (replace with your targets)
+#python3 onion_crawler.py \
+ # --seeds "http://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.onion/" \
+ #         "http://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.onion/" \ 
+#  --same-host-only \
+#  --max-pages 80 \
+#  --max-per-host 15 \
+#  --max-depth 2 \
+  --delay 3.0
