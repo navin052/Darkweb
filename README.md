@@ -388,12 +388,19 @@ Tool: https://www.paterva.com/
 How OSINT Professionals Use These Resources
 
 Use Case 	                 Dark Web Resource Used
+
 Credential Leak Detection   ->	DeHashed, LeakLooker, DeepPaste
+
 Marketplace Monitoring    	->  Dread, Onion.Live, Hidden Wiki
+
 Forum Tracking              ->	Dread, Not Evil, IntelX
+
 Whistleblower Support       ->	SecureDrop, ZeroBin
+
 Dark Web Enumeration        ->	Ahmia, Haystak, Daniel’s Onion Directory
+
 Evidence Collection         ->	DeepPaste, Tunnels, IntelX
+
 Real-time Monitoring        ->	Onion.Live, LeakLooker, Tor Metrics
 
  
