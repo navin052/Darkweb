@@ -76,6 +76,7 @@ Biden Cash: The market is used for illegal transactions, carding, and other fina
 1. Awazon Market
 
     Direct link 1: awazonhndi7e5yfaobpk7j2tsnp4kfd2xa63tdtzcg7plc5fka4il4ad.onion/auth/register_now
+   
     Direct link 2: awazonmphskqrqr5fquam6h24dcifybo4wlzqzlw52edkn3nzfnmh6qd.onion/auth/register_now
 
 Established in 2020, Awazon Market has quickly become one of the most famous darknet marketplaces. The market claims to provide secure and anonymous commerce services. You can find a lot of goods and services packed with stealth high-level encryption, no JavaScript, and anti-DDoS protection. This ensures a maximum level of privacy.
