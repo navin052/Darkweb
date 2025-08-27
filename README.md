@@ -284,38 +284,48 @@ Below are the most trusted and widely used tools, directories, and platforms by 
 
 A clean, user-friendly Tor search engine that filters illegal content and indexes .onion domains.
 URL: https://ahmia.fi
+
 2. Daniel’s Onion Directory
 
 A categorized .onion directory for quick navigation of active and popular dark web sites.
 URL: http://daniel.onion (accessible via Tor)
+
 3. Dark.fail
 
 An uptime tracker and directory that helps verify whether a .onion site is authentic and online.
 URL: http://dark.fail (via Tor)
+
 4. The Hidden Wiki
 
 A popular community-curated directory of .onion links categorized by services and topics.
 URL: http://zqktlwi4fecvo6ri.onion
+
 5. TorLinks
 
 Another reliable dark web link directory with a clear and categorized layout.
 URL: http://torlinkbgs6aabns.onion
+
 6. IntelX Darknet Search
 
 An enterprise-grade dark web search engine indexing dumps, forums, and marketplaces.
 URL: https://intelx.io
+
 7. OnionLand Search
 
 Useful for indexing conversations and content from dark web forums.
 URL: https://onionlandsearchengine.com
+
 8. Deep Web Radio
 
 Streams underground audio broadcasts. Can be used for behavioral tracking in niche OSINT operations.
 URL: http://76qugh5bey5gum7l.onion
+
 9. Haystak
 
 Advanced dark web search engine with extended pro options for deeper exploration.
 URL: http://haystakvxad7wbk5.onion
+
+
 10. Dread
 
 A Reddit-style forum on the dark web where users discuss tools, threats, vendors, and hacks.
@@ -324,47 +334,59 @@ URL: http://dready7ef2nc3sh4.onion
 
 Once a major marketplace, its archives are useful for threat pattern analysis.
 URL: (Access via intelligence archives or reports)
+
 12. Tunnels
 
 Maps known .onion services and active relays. Helpful for technical enumeration.
 URL: https://tunnels.web.app/
+
 13. ZeroBin
 
 Dark web version of Pastebin, used to anonymously share encrypted text.
 URL: http://zerobinw4rlc26p.onion
+
 14. Not Evil
 
 Privacy-respecting dark web search engine with minimal tracking.
 URL: http://hss3uro2hsxfogfq.onion
+
 15. SecureDrop
 
 Used by journalists and whistleblowers to share sensitive files securely.
 URL: Depends on the media outlet (e.g., NYT, ProPublica)
+
 16. Tor Metrics
 
 Provides Tor network analytics and usage statistics. Useful for behavior and volume tracking.
 URL: https://metrics.torproject.org/
+
 17. Onion.Live
 
 A real-time dark web status checker and .onion search engine with community trust votes.
 URL: https://onion.live
+
 18. DeHashed
 
 Searchable breach database with email, username, and hash information.
 URL: https://www.dehashed.com
+
 19. LeakLooker
 
 Tracks and indexes real-time data leaks posted on underground and surface forums.
 URL: https://leaklooker.com
+
 20. DeepPaste
 
 A dark web paste site frequently used to dump credentials and malicious code.
 URL: http://deeppastezq5pkwu.onion
+
 21. Maltego + Darknet Plugins
 
 A visual link analysis tool that connects darknet data with OSINT workflows via plugins.
 Tool: https://www.paterva.com/
+
 How OSINT Professionals Use These Resources
+
 Use Case 	                 Dark Web Resource Used
 Credential Leak Detection   ->	DeHashed, LeakLooker, DeepPaste
 Marketplace Monitoring    	->  Dread, Onion.Live, Hidden Wiki
